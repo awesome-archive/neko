@@ -26,9 +26,10 @@ type SessionManager struct {
 
 func (m *SessionManager) New(id string, admin bool, socket *websocket.Conn) *Session {
 	session := &Session{
-		ID:     id,
-		Admin:  admin,
-		socket: socket,
+		ID:        id,
+		Admin:     admin,
+		socket:    socket,
+		connected: false,
 	}
 
 	m.members[id] = session
@@ -76,6 +77,17 @@ func (m *SessionManager) Get(id string) (*Session, bool) {
 	return session, ok
 }
 
+func (m *SessionManager) GetConnected() []*Session {
+	var sessions []*Session
+	for _, sess := range m.members {
+		if sess.connected {
+			sessions = append(sessions, sess)
+		}
+	}
+
+	return sessions
+}
+
 func (m *SessionManager) Set(id string, session *Session) {
 	m.members[id] = session
 }
@@ -115,10 +127,36 @@ func (m *SessionManager) SetName(id string, name string) (bool, error) {
 	session, ok := m.members[id]
 	if ok {
 		session.Name = name
+		session.connected = true
+		m.emmiter.Emit("connected", id, session)
 		return true, nil
 	}
 
 	return false, fmt.Errorf("invalid session id %s", id)
+}
+
+func (m *SessionManager) Mute(id string) error {
+	session, ok := m.members[id]
+	if ok {
+		session.Muted = true
+	}
+	return nil
+}
+
+func (m *SessionManager) Unmute(id string) error {
+	session, ok := m.members[id]
+	if ok {
+		session.Muted = false
+	}
+	return nil
+}
+
+func (m *SessionManager) Kick(id string, v interface{}) error {
+	session, ok := m.members[id]
+	if ok {
+		return session.Kick(v)
+	}
+	return nil
 }
 
 func (m *SessionManager) Clear() error {
@@ -126,24 +164,21 @@ func (m *SessionManager) Clear() error {
 }
 
 func (m *SessionManager) Brodcast(v interface{}, exclude interface{}) error {
-	if exclude != nil {
-		for id, sess := range m.members {
+	for id, sess := range m.members {
+		if !sess.connected {
+			continue
+		}
+
+		if exclude != nil {
 			if in, _ := utils.ArrayIn(id, exclude); in {
 				continue
 			}
-
-			if err := sess.Send(v); err != nil {
-				return err
-			}
 		}
-	} else {
-		for _, sess := range m.members {
-			if err := sess.Send(v); err != nil {
-				return err
-			}
+
+		if err := sess.Send(v); err != nil {
+			return err
 		}
 	}
-
 	return nil
 }
 
@@ -161,6 +196,12 @@ func (m *SessionManager) OnHostCleared(listener func(id string)) {
 
 func (m *SessionManager) OnCreated(listener func(id string, session *Session)) {
 	m.emmiter.On("created", func(payload ...interface{}) {
+		listener(payload[0].(string), payload[1].(*Session))
+	})
+}
+
+func (m *SessionManager) OnConnected(listener func(id string, session *Session)) {
+	m.emmiter.On("connected", func(payload ...interface{}) {
 		listener(payload[0].(string), payload[1].(*Session))
 	})
 }

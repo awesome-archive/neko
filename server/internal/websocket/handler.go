@@ -6,12 +6,14 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
-	gonanoid "github.com/matoous/go-nanoid"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 
 	"n.eko.moe/neko/internal/config"
+	"n.eko.moe/neko/internal/event"
+	"n.eko.moe/neko/internal/message"
 	"n.eko.moe/neko/internal/session"
+	"n.eko.moe/neko/internal/utils"
 	"n.eko.moe/neko/internal/webrtc"
 )
 
@@ -31,14 +33,14 @@ func New(sessions *session.SessionManager, webrtc *webrtc.WebRTCManager, conf *c
 			logger:   logger.With().Str("subsystem", "handler").Logger(),
 			sessions: sessions,
 			webrtc:   webrtc,
+			banned:   make(map[string]bool),
+			locked:   false,
 		},
 	}
 }
 
 // Send pings to peer with this period. Must be less than pongWait.
 const pingPeriod = 60 * time.Second
-
-const alphabet = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
 
 type WebSocketHandler struct {
 	logger   zerolog.Logger
@@ -65,15 +67,23 @@ func (ws *WebSocketHandler) Start() error {
 	}()
 
 	ws.sessions.OnCreated(func(id string, session *session.Session) {
-		if err := ws.handler.Created(id, session); err != nil {
+		if err := ws.handler.SessionCreated(id, session); err != nil {
 			ws.logger.Warn().Str("id", id).Err(err).Msg("session created with and error")
 		} else {
 			ws.logger.Debug().Str("id", id).Msg("session created")
 		}
 	})
 
+	ws.sessions.OnConnected(func(id string, session *session.Session) {
+		if err := ws.handler.SessionConnected(id, session); err != nil {
+			ws.logger.Warn().Str("id", id).Err(err).Msg("session connected with and error")
+		} else {
+			ws.logger.Debug().Str("id", id).Msg("session connected")
+		}
+	})
+
 	ws.sessions.OnDestroy(func(id string) {
-		if err := ws.handler.Destroyed(id); err != nil {
+		if err := ws.handler.SessionDestroyed(id); err != nil {
 			ws.logger.Warn().Str("id", id).Err(err).Msg("session destroyed with and error")
 		} else {
 			ws.logger.Debug().Str("id", id).Msg("session destroyed")
@@ -100,9 +110,38 @@ func (ws *WebSocketHandler) Upgrade(w http.ResponseWriter, r *http.Request) erro
 	id, admin, err := ws.authenticate(r)
 	if err != nil {
 		ws.logger.Warn().Err(err).Msg("authenticatetion failed")
+
+		if err = socket.WriteJSON(message.Disconnect{
+			Event:   event.SYSTEM_DISCONNECT,
+			Message: "invalid password",
+		}); err != nil {
+			ws.logger.Error().Err(err).Msg("failed to send disconnect")
+		}
+
 		if err = socket.Close(); err != nil {
 			return err
 		}
+		return nil
+	}
+
+	ok, reason, err := ws.handler.SocketConnected(id, socket)
+	if err != nil {
+		ws.logger.Error().Err(err).Msg("connection failed")
+		return err
+	}
+
+	if !ok {
+		if err = socket.WriteJSON(message.Disconnect{
+			Event:   event.SYSTEM_DISCONNECT,
+			Message: reason,
+		}); err != nil {
+			ws.logger.Error().Err(err).Msg("failed to send disconnect")
+		}
+
+		if err = socket.Close(); err != nil {
+			return err
+		}
+
 		return nil
 	}
 
@@ -122,20 +161,12 @@ func (ws *WebSocketHandler) Upgrade(w http.ResponseWriter, r *http.Request) erro
 			Msg("session ended")
 	}()
 
-	if err = ws.handler.Connected(id, socket); err != nil {
-		ws.logger.Error().Err(err).Msg("connection failed")
-		if err = socket.Close(); err != nil {
-			return err
-		}
-		return nil
-	}
-
 	ws.handle(socket, id)
 	return nil
 }
 
 func (ws *WebSocketHandler) authenticate(r *http.Request) (string, bool, error) {
-	id, err := gonanoid.Generate(alphabet, 32)
+	id, err := utils.NewUID(32)
 	if err != nil {
 		return "", false, err
 	}
@@ -165,7 +196,7 @@ func (ws *WebSocketHandler) handle(socket *websocket.Conn, id string) {
 		defer func() {
 			ticker.Stop()
 			ws.logger.Debug().Str("address", socket.RemoteAddr().String()).Msg("handle socket ending")
-			ws.handler.Disconnected(id)
+			ws.handler.SocketDisconnected(id)
 		}()
 
 		for {
